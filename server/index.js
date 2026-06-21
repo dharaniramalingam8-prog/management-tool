@@ -114,8 +114,9 @@ async function checkDeadlines() {
   try {
     const db = getDb();
     const tomorrowTasks = await db.all(`
-      SELECT t.id, t.title, t.project_id
+      SELECT t.id, t.title, l.project_id
       FROM tasks t
+      JOIN lists l ON t.list_id = l.id
       WHERE date(t.due_date) = date('now', '+1 day')
     `);
 
