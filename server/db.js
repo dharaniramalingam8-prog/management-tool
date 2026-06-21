@@ -39,6 +39,8 @@ export async function initDb() {
     CREATE TABLE IF NOT EXISTS project_members (
       project_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL,
+      role TEXT DEFAULT 'member',
+      joined_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (project_id, user_id),
       FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -65,6 +67,14 @@ export async function initDb() {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(list_id) REFERENCES lists(id) ON DELETE CASCADE,
       FOREIGN KEY(assignee_id) REFERENCES users(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS task_assignees (
+      task_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      PRIMARY KEY (task_id, user_id),
+      FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS comments (
@@ -107,7 +117,64 @@ export async function initDb() {
       FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS attachments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id INTEGER NOT NULL,
+      filename TEXT NOT NULL,
+      filepath TEXT NOT NULL,
+      uploaded_by INTEGER NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+      FOREIGN KEY(uploaded_by) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS milestones (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      due_date TEXT,
+      FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    );
   `);
+
+  // Migration for existing tables: check if 'role' column exists, if not, add it.
+  try {
+    const columns = await db.all('PRAGMA table_info(project_members)');
+    const hasRole = columns.some(c => c.name === 'role');
+    if (!hasRole) {
+      await db.run("ALTER TABLE project_members ADD COLUMN role TEXT DEFAULT 'member'");
+      console.log('Migrated project_members: added role column');
+    }
+
+    const taskCols = await db.all('PRAGMA table_info(tasks)');
+    const hasMilestone = taskCols.some(c => c.name === 'milestone_id');
+    if (!hasMilestone) {
+      await db.run("ALTER TABLE tasks ADD COLUMN milestone_id INTEGER");
+      console.log('Migrated tasks: added milestone_id column');
+    }
+    const hasJoinedAt = columns.some(c => c.name === 'joined_at');
+    if (!hasJoinedAt) {
+      await db.run("ALTER TABLE project_members ADD COLUMN joined_at DATETIME");
+      await db.run("UPDATE project_members SET joined_at = CURRENT_TIMESTAMP WHERE joined_at IS NULL");
+      console.log('Migrated project_members: added joined_at column');
+    }
+  } catch (err) {
+    console.error('Migration error:', err);
+  }
+
+  // Migrate legacy assignee_id to task_assignees
+  try {
+    const columns = await db.all('PRAGMA table_info(tasks)');
+    const hasAssignee = columns.some(c => c.name === 'assignee_id');
+    if (hasAssignee) {
+      await db.run(`
+        INSERT OR IGNORE INTO task_assignees (task_id, user_id)
+        SELECT id, assignee_id FROM tasks WHERE assignee_id IS NOT NULL
+      `);
+    }
+  } catch(err) {
+    console.error('Migration error tasks:', err);
+  }
 
   console.log('Database initialized successfully with SQLite.');
   return db;

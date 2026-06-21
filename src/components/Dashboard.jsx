@@ -3,7 +3,10 @@ import { api } from '../utils/api';
 import { useAuth } from '../context/AuthContext';
 import { useSocket } from '../context/SocketContext';
 import { useNavigate } from 'react-router-dom';
-import { Plus, LogOut, Bell, Folder, CheckSquare, Users, X } from 'lucide-react';
+import { 
+  Plus, CheckSquare, Folder, Users, Bell, 
+  LogOut, X, Moon, Sun 
+} from 'lucide-react';
 
 export default function Dashboard() {
   const { user, logout } = useAuth();
@@ -12,6 +15,7 @@ export default function Dashboard() {
 
   const [projects, setProjects] = useState([]);
   const [notifications, setNotifications] = useState([]);
+  const [dashboardStats, setDashboardStats] = useState({ overdueTasks: [], workload: [] });
   const [showNotifDropdown, setShowNotifDropdown] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
   
@@ -20,6 +24,21 @@ export default function Dashboard() {
   const [projectDesc, setProjectDesc] = useState('');
   const [createLoading, setCreateLoading] = useState(false);
   const [error, setError] = useState('');
+
+  // Theme state
+  const [isLightMode, setIsLightMode] = useState(
+    localStorage.getItem('theme') === 'light'
+  );
+
+  useEffect(() => {
+    if (isLightMode) {
+      document.body.classList.add('light-theme');
+      localStorage.setItem('theme', 'light');
+    } else {
+      document.body.classList.remove('light-theme');
+      localStorage.setItem('theme', 'dark');
+    }
+  }, [isLightMode]);
 
   // Fetch Projects & Notifications
   useEffect(() => {
@@ -30,6 +49,9 @@ export default function Dashboard() {
 
         const notifData = await api.get('/notifications');
         setNotifications(notifData);
+
+        const statsData = await api.get('/dashboard/stats');
+        setDashboardStats(statsData);
       } catch (err) {
         console.error('Error fetching dashboard data:', err);
       }
@@ -100,10 +122,19 @@ export default function Dashboard() {
       <nav className="navbar">
         <div className="nav-logo" onClick={() => navigate('/')}>
           <CheckSquare size={24} style={{ color: 'var(--primary)' }} />
-          <span>Antigravity Kanban</span>
+          <span>Project Nexus</span>
         </div>
 
         <div className="nav-actions">
+          {/* Theme Toggle */}
+          <button 
+            className="btn btn-secondary btn-icon" 
+            onClick={() => setIsLightMode(!isLightMode)}
+            title="Toggle Theme"
+          >
+            {isLightMode ? <Moon size={18} /> : <Sun size={18} />}
+          </button>
+
           {/* Notifications */}
           <div className="notification-bell-container" style={{ position: 'relative' }}>
             <button 
@@ -210,6 +241,71 @@ export default function Dashboard() {
         </div>
 
         {/* Projects Grid */}
+        <div className="section-header" style={{ marginTop: '20px' }}>
+          <h2>Forecast & Risk Analysis</h2>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '32px' }}>
+          {/* Overdue Tasks Panel */}
+          <div className="glass-panel" style={{ borderTop: '4px solid var(--priority-high)' }}>
+            <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px', color: 'var(--priority-high)' }}>
+              <Bell size={18} /> Overdue Tasks ({dashboardStats.overdueTasks.length})
+            </h3>
+            {dashboardStats.overdueTasks.length === 0 ? (
+              <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>No overdue tasks! You're all caught up.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', maxHeight: '300px', overflowY: 'auto' }}>
+                {dashboardStats.overdueTasks.map(task => {
+                  const daysOverdue = Math.floor((new Date() - new Date(task.due_date)) / (1000 * 60 * 60 * 24));
+                  return (
+                    <div key={task.id} style={{ background: 'var(--bg-input)', padding: '12px', borderRadius: '8px', borderLeft: '3px solid var(--priority-high)' }}>
+                      <div style={{ fontWeight: '500', fontSize: '0.95rem' }}>{task.title}</div>
+                      <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
+                        Project: {task.project_name}
+                      </div>
+                      <div style={{ fontSize: '0.8rem', color: 'var(--priority-high)', marginTop: '4px', fontWeight: '600' }}>
+                        {daysOverdue} days overdue
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Workload Distribution Panel */}
+          <div className="glass-panel" style={{ borderTop: '4px solid var(--primary)' }}>
+            <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '16px' }}>
+              <Users size={18} color="var(--primary)" /> Team Workload
+            </h3>
+            {dashboardStats.workload.length === 0 ? (
+              <div style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>No tasks assigned.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', maxHeight: '300px', overflowY: 'auto' }}>
+                {dashboardStats.workload.map((member, idx) => (
+                  <div key={member.id} style={{ background: 'var(--bg-input)', padding: '12px', borderRadius: '8px', display: 'flex', alignItems: 'center', gap: '12px' }}>
+                    <div className="avatar" style={{ width: '36px', height: '36px', fontSize: '1rem', flexShrink: 0 }}>
+                      {member.username.substring(0, 2).toUpperCase()}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: '500', display: 'flex', justifyContent: 'space-between' }}>
+                        <span>
+                          {member.username} 
+                          {idx === 0 && <span style={{ marginLeft: '8px', fontSize: '0.75rem', background: 'var(--primary-glow)', color: 'var(--primary)', padding: '2px 6px', borderRadius: '4px' }}>🏆 Top Contributor</span>}
+                        </span>
+                        <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>{member.task_count * 10} pts</span>
+                      </div>
+                      <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
+                        {member.task_count} tasks assigned
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
         <div className="section-header">
           <h2>Your Projects</h2>
         </div>
@@ -233,7 +329,18 @@ export default function Dashboard() {
               >
                 <h3>{p.name}</h3>
                 <p className="project-desc">{p.description || 'No description provided.'}</p>
-                <div className="project-meta">
+                <div className="project-meta" style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', gap: '8px', alignItems: 'flex-start' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%' }}>
+                    <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Progress ({p.completed_tasks || 0}/{p.total_tasks || 0})</span>
+                    <span style={{ fontSize: '0.85rem', fontWeight: 'bold', color: 'var(--primary)' }}>
+                      {p.total_tasks > 0 ? Math.round((p.completed_tasks / p.total_tasks) * 100) : 0}%
+                    </span>
+                  </div>
+                  <div style={{ width: '100%', height: '6px', background: 'rgba(255,255,255,0.05)', borderRadius: '3px', overflow: 'hidden' }}>
+                    <div style={{ height: '100%', background: 'var(--primary)', width: `${p.total_tasks > 0 ? Math.round((p.completed_tasks / p.total_tasks) * 100) : 0}%`, transition: 'width 0.3s ease' }}></div>
+                  </div>
+                </div>
+                <div className="project-meta" style={{ marginTop: '12px' }}>
                   <div className="project-members-avatars">
                     {Array.from({ length: Math.min(p.member_count || 1, 4) }).map((_, i) => (
                       <div key={i} className="project-member-avatar-overlap">

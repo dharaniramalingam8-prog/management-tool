@@ -1,8 +1,23 @@
 import express from 'express';
+import multer from 'multer';
+import path from 'path';
 import { getDb } from '../db.js';
 import { authMiddleware } from '../middleware/auth.js';
 
 const router = express.Router();
+
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, 'uploads/');
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ storage: storage });
+
 
 // Helper: check if user is a member of project
 async function checkMember(projectId, userId) {
@@ -19,6 +34,21 @@ async function checkMember(projectId, userId) {
   return !!member;
 }
 
+// Helper: check if user is an admin of project
+async function checkAdmin(projectId, userId) {
+  const db = getDb();
+  // Check if owner
+  const project = await db.get('SELECT id FROM projects WHERE id = ? AND owner_id = ?', [projectId, userId]);
+  if (project) return true;
+
+  // Check if member with admin role
+  const member = await db.get(
+    'SELECT role FROM project_members WHERE project_id = ? AND user_id = ?',
+    [projectId, userId]
+  );
+  return member && member.role === 'admin';
+}
+
 // Helper: Log activities
 async function logActivity(projectId, taskId, userId, content) {
   try {
@@ -33,7 +63,7 @@ async function logActivity(projectId, taskId, userId, content) {
 }
 
 // Helper: Send live notifications
-async function sendNotification(io, userId, title, content, type) {
+export async function sendNotification(io, userId, title, content, type) {
   try {
     const db = getDb();
     const result = await db.run(
@@ -67,7 +97,12 @@ router.get('/projects', authMiddleware, async (req, res) => {
     const db = getDb();
     const projects = await db.all(`
       SELECT DISTINCT p.*, u.username as owner_name,
-             (SELECT COUNT(*) FROM project_members WHERE project_id = p.id) as member_count
+             (SELECT COUNT(*) FROM project_members WHERE project_id = p.id) as member_count,
+             (SELECT COUNT(*) FROM tasks t JOIN lists l ON t.list_id = l.id WHERE l.project_id = p.id) as total_tasks,
+             (SELECT COUNT(*) FROM tasks t JOIN lists l ON t.list_id = l.id
+              WHERE l.project_id = p.id
+                AND l.id = (SELECT id FROM lists WHERE project_id = p.id ORDER BY position DESC LIMIT 1)
+             ) as completed_tasks
       FROM projects p
       JOIN users u ON p.owner_id = u.id
       LEFT JOIN project_members pm ON p.id = pm.project_id
@@ -79,6 +114,50 @@ router.get('/projects', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Get projects error:', error);
     res.status(500).json({ error: 'Server error fetching projects' });
+  }
+});
+
+// Get Dashboard Stats (Overdue Tasks & Team Workload)
+router.get('/dashboard/stats', authMiddleware, async (req, res) => {
+  try {
+    const db = getDb();
+    const userId = req.user.id;
+
+    // Fetch overdue tasks assigned to the user
+    // A task is overdue if due_date < current date, and it is not in the last column (Done)
+    const overdueTasks = await db.all(`
+      SELECT t.*, p.name as project_name
+      FROM tasks t
+      JOIN task_assignees ta ON t.id = ta.task_id
+      JOIN lists l ON t.list_id = l.id
+      JOIN projects p ON l.project_id = p.id
+      WHERE ta.user_id = ?
+        AND t.due_date IS NOT NULL 
+        AND date(t.due_date) < date('now')
+        AND l.position < (SELECT MAX(position) FROM lists WHERE project_id = p.id)
+    `, [userId]);
+
+    // Fetch team workload: counts for all users in the same projects as current user
+    const workload = await db.all(`
+      SELECT u.id, u.username, COUNT(ta.task_id) as task_count
+      FROM users u
+      JOIN task_assignees ta ON u.id = ta.user_id
+      JOIN tasks t ON ta.task_id = t.id
+      JOIN lists l ON t.list_id = l.id
+      WHERE l.project_id IN (
+        SELECT project_id FROM project_members WHERE user_id = ?
+        UNION
+        SELECT id FROM projects WHERE owner_id = ?
+      )
+      AND l.position < (SELECT MAX(position) FROM lists WHERE project_id = l.project_id)
+      GROUP BY u.id
+      ORDER BY task_count DESC
+    `, [userId, userId]);
+
+    res.json({ overdueTasks, workload });
+  } catch (error) {
+    console.error('Get dashboard stats error:', error);
+    res.status(500).json({ error: 'Server error fetching dashboard stats' });
   }
 });
 
@@ -100,7 +179,7 @@ router.post('/projects', authMiddleware, async (req, res) => {
 
     // Add owner to members
     await db.run(
-      'INSERT INTO project_members (project_id, user_id) VALUES (?, ?)',
+      "INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, 'admin')",
       [projectId, req.user.id]
     );
 
@@ -120,6 +199,32 @@ router.post('/projects', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Create project error:', error);
     res.status(500).json({ error: 'Server error creating project' });
+  }
+});
+
+// Delete project (owner only)
+router.delete('/projects/:id', authMiddleware, async (req, res) => {
+  const projectId = req.params.id;
+  const io = req.app.get('io');
+  try {
+    const db = getDb();
+    const project = await db.get('SELECT * FROM projects WHERE id = ?', [projectId]);
+    if (!project) return res.status(404).json({ error: 'Project not found' });
+    if (project.owner_id !== req.user.id) {
+      return res.status(403).json({ error: 'Only the project owner can delete this project' });
+    }
+
+    // Cascade is enabled via PRAGMA foreign_keys, so this deletes all lists, tasks, comments etc.
+    await db.run('DELETE FROM projects WHERE id = ?', [projectId]);
+
+    if (io) {
+      io.to(`project:${projectId}`).emit('project-deleted', { projectId });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete project error:', error);
+    res.status(500).json({ error: 'Server error deleting project' });
   }
 });
 
@@ -144,25 +249,43 @@ router.get('/projects/:id', authMiddleware, async (req, res) => {
 
     // Members
     const members = await db.all(`
-      SELECT u.id, u.username, u.email 
+      SELECT u.id, u.username, u.email, pm.role, pm.joined_at,
+             (SELECT COUNT(*) FROM task_assignees ta JOIN tasks t ON ta.task_id = t.id JOIN lists l ON t.list_id = l.id WHERE ta.user_id = u.id AND l.project_id = ?) as assigned_tasks_count
       FROM users u 
       JOIN project_members pm ON u.id = pm.user_id 
       WHERE pm.project_id = ?
-    `, [projectId]);
+    `, [projectId, projectId]);
 
     // Lists
     const lists = await db.all(`
       SELECT * FROM lists WHERE project_id = ? ORDER BY position ASC
     `, [projectId]);
 
-    // Tasks (with assignee details)
+    // Tasks
     const tasks = await db.all(`
-      SELECT t.*, u.username as assignee_name, u.email as assignee_email
-      FROM tasks t
-      LEFT JOIN users u ON t.assignee_id = u.id
-      WHERE t.list_id IN (SELECT id FROM lists WHERE project_id = ?)
-      ORDER BY t.position ASC
+      SELECT *
+      FROM tasks
+      WHERE list_id IN (SELECT id FROM lists WHERE project_id = ?)
+      ORDER BY position ASC
     `, [projectId]);
+
+    // Fetch assignees for tasks
+    const assignees = await db.all(`
+      SELECT ta.task_id, u.id as user_id, u.username, u.email
+      FROM task_assignees ta
+      JOIN users u ON ta.user_id = u.id
+      WHERE ta.task_id IN (
+        SELECT t.id FROM tasks t 
+        JOIN lists l ON t.list_id = l.id 
+        WHERE l.project_id = ?
+      )
+    `, [projectId]);
+
+    const assigneesMap = {};
+    assignees.forEach(a => {
+      if (!assigneesMap[a.task_id]) assigneesMap[a.task_id] = [];
+      assigneesMap[a.task_id].push({ id: a.user_id, username: a.username, email: a.email });
+    });
 
     // For each task, fetch checklist completion summary
     const checklistSummaries = await db.all(`
@@ -206,6 +329,7 @@ router.get('/projects/:id', authMiddleware, async (req, res) => {
 
     const tasksWithMetadata = tasks.map(task => ({
       ...task,
+      assignees: assigneesMap[task.id] || [],
       checklist_summary: checklistMap[task.id] || { total: 0, completed: 0 },
       comment_count: commentsMap[task.id] || 0
     }));
@@ -218,10 +342,24 @@ router.get('/projects/:id', authMiddleware, async (req, res) => {
       };
     });
 
+    // Fetch Milestones
+    const milestones = await db.all(`
+      SELECT m.*, 
+             (SELECT COUNT(*) FROM tasks WHERE milestone_id = m.id) as total_tasks,
+             (SELECT COUNT(*) FROM tasks t 
+              JOIN checklists c ON t.id = c.task_id 
+              -- we can calculate completion differently, maybe if tasks are in the last list?
+              WHERE t.milestone_id = m.id AND t.list_id = (SELECT id FROM lists WHERE project_id = ? ORDER BY position DESC LIMIT 1)
+             ) as completed_tasks
+      FROM milestones m
+      WHERE m.project_id = ?
+    `, [projectId, projectId]);
+
     res.json({
       project,
       members,
-      lists: listsWithTasks
+      lists: listsWithTasks,
+      milestones
     });
   } catch (error) {
     console.error('Fetch project details error:', error);
@@ -232,7 +370,7 @@ router.get('/projects/:id', authMiddleware, async (req, res) => {
 // Add member to project by email
 router.post('/projects/:id/members', authMiddleware, async (req, res) => {
   const projectId = req.params.id;
-  const { email } = req.body;
+  const { email, role } = req.body;
   const io = req.app.get('io');
 
   if (!email) {
@@ -240,9 +378,9 @@ router.post('/projects/:id/members', authMiddleware, async (req, res) => {
   }
 
   try {
-    const isOwnerOrMember = await checkMember(projectId, req.user.id);
-    if (!isOwnerOrMember) {
-      return res.status(403).json({ error: 'Access denied' });
+    const isAdmin = await checkAdmin(projectId, req.user.id);
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Only admins can invite members' });
     }
 
     const db = getDb();
@@ -267,9 +405,10 @@ router.post('/projects/:id/members', authMiddleware, async (req, res) => {
     }
 
     // Insert member
+    const assignRole = role === 'admin' ? 'admin' : 'member';
     await db.run(
-      'INSERT INTO project_members (project_id, user_id) VALUES (?, ?)',
-      [projectId, userToInvite.id]
+      "INSERT INTO project_members (project_id, user_id, role, joined_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+      [projectId, userToInvite.id, assignRole]
     );
 
     // Log Activity
@@ -293,6 +432,153 @@ router.post('/projects/:id/members', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Invite member error:', error);
     res.status(500).json({ error: 'Server error inviting member' });
+  }
+});
+
+// Change member role
+router.put('/projects/:id/members/:userId', authMiddleware, async (req, res) => {
+  const projectId = req.params.id;
+  const targetUserId = req.params.userId;
+  const { role } = req.body;
+  const io = req.app.get('io');
+
+  if (!role || !['admin', 'member'].includes(role)) {
+    return res.status(400).json({ error: 'Valid role is required' });
+  }
+
+  try {
+    const isAdmin = await checkAdmin(projectId, req.user.id);
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Only admins can change roles' });
+    }
+
+    const db = getDb();
+    
+    // Check if target user is the owner (owner role cannot be changed)
+    const project = await db.get('SELECT owner_id FROM projects WHERE id = ?', [projectId]);
+    if (project.owner_id === parseInt(targetUserId)) {
+      return res.status(400).json({ error: 'Cannot change the role of the project owner' });
+    }
+
+    await db.run('UPDATE project_members SET role = ? WHERE project_id = ? AND user_id = ?', [role, projectId, targetUserId]);
+    
+    await logActivity(projectId, null, req.user.id, `changed a member's role to ${role}`);
+
+    if (io) {
+      io.to(`project:${projectId}`).emit('board-updated', { type: 'member-updated' });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Change role error:', error);
+    res.status(500).json({ error: 'Server error changing role' });
+  }
+});
+
+// Remove member
+router.delete('/projects/:id/members/:userId', authMiddleware, async (req, res) => {
+  const projectId = req.params.id;
+  const targetUserId = req.params.userId;
+  const io = req.app.get('io');
+
+  try {
+    const isAdmin = await checkAdmin(projectId, req.user.id);
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Only admins can remove members' });
+    }
+
+    const db = getDb();
+
+    // Check if target user is the owner
+    const project = await db.get('SELECT owner_id FROM projects WHERE id = ?', [projectId]);
+    if (project.owner_id === parseInt(targetUserId)) {
+      return res.status(400).json({ error: 'Cannot remove the project owner' });
+    }
+
+    await db.run('DELETE FROM project_members WHERE project_id = ? AND user_id = ?', [projectId, targetUserId]);
+    // Also remove them from any task assignments in this project
+    await db.run(`
+      DELETE FROM task_assignees 
+      WHERE user_id = ? AND task_id IN (
+        SELECT t.id FROM tasks t JOIN lists l ON t.list_id = l.id WHERE l.project_id = ?
+      )
+    `, [targetUserId, projectId]);
+
+    await logActivity(projectId, null, req.user.id, `removed a member from the project`);
+
+    if (io) {
+      io.to(`project:${projectId}`).emit('board-updated', { type: 'member-removed' });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Remove member error:', error);
+    res.status(500).json({ error: 'Server error removing member' });
+  }
+});
+
+// --- MILESTONES ---
+
+router.post('/projects/:id/milestones', authMiddleware, async (req, res) => {
+  const projectId = req.params.id;
+  const { title, due_date } = req.body;
+  const io = req.app.get('io');
+
+  if (!title) {
+    return res.status(400).json({ error: 'Milestone title is required' });
+  }
+
+  try {
+    const isJoined = await checkMember(projectId, req.user.id);
+    if (!isJoined) return res.status(403).json({ error: 'Access denied' });
+
+    const db = getDb();
+    const result = await db.run(
+      'INSERT INTO milestones (project_id, title, due_date) VALUES (?, ?, ?)',
+      [projectId, title, due_date || null]
+    );
+
+    await logActivity(projectId, null, req.user.id, `created milestone "${title}"`);
+
+    if (io) {
+      io.to(`project:${projectId}`).emit('board-updated', { type: 'milestone-created' });
+    }
+
+    const newMilestone = await db.get('SELECT * FROM milestones WHERE id = ?', [result.lastID]);
+    res.status(201).json(newMilestone);
+  } catch (error) {
+    console.error('Create milestone error:', error);
+    res.status(500).json({ error: 'Server error creating milestone' });
+  }
+});
+
+router.delete('/projects/:id/milestones/:milestoneId', authMiddleware, async (req, res) => {
+  const projectId = req.params.id;
+  const milestoneId = req.params.milestoneId;
+  const io = req.app.get('io');
+
+  try {
+    const isAdmin = await checkAdmin(projectId, req.user.id);
+    if (!isAdmin) {
+      return res.status(403).json({ error: 'Only admins can delete milestones' });
+    }
+
+    const db = getDb();
+    
+    // Clear milestone_id from tasks
+    await db.run('UPDATE tasks SET milestone_id = NULL WHERE milestone_id = ?', [milestoneId]);
+    await db.run('DELETE FROM milestones WHERE id = ?', [milestoneId]);
+
+    await logActivity(projectId, null, req.user.id, `deleted a milestone`);
+
+    if (io) {
+      io.to(`project:${projectId}`).emit('board-updated', { type: 'milestone-deleted' });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete milestone error:', error);
+    res.status(500).json({ error: 'Server error deleting milestone' });
   }
 });
 
@@ -415,7 +701,7 @@ router.delete('/lists/:id', authMiddleware, async (req, res) => {
 // Add task to a list
 router.post('/lists/:listId/tasks', authMiddleware, async (req, res) => {
   const listId = req.params.listId;
-  const { title, description, priority, due_date, assignee_id } = req.body;
+  const { title, description, priority, due_date, assignee_ids, milestone_id } = req.body;
   const io = req.app.get('io');
 
   if (!title) {
@@ -437,8 +723,8 @@ router.post('/lists/:listId/tasks', authMiddleware, async (req, res) => {
     const position = posRow.maxPos !== null ? posRow.maxPos + 1 : 0;
 
     const result = await db.run(`
-      INSERT INTO tasks (list_id, title, description, position, priority, due_date, assignee_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tasks (list_id, title, description, position, priority, due_date, assignee_id, milestone_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `, [
       listId,
       title,
@@ -446,23 +732,36 @@ router.post('/lists/:listId/tasks', authMiddleware, async (req, res) => {
       position,
       priority || 'medium',
       due_date || null,
-      assignee_id || null
+      null, // legacy assignee_id left null
+      milestone_id || null
     ]);
 
     const taskId = result.lastID;
     
+    // Insert assignees
+    const assigneesToReturn = [];
+    if (assignee_ids && Array.isArray(assignee_ids) && assignee_ids.length > 0) {
+      for (const uid of assignee_ids) {
+        await db.run('INSERT INTO task_assignees (task_id, user_id) VALUES (?, ?)', [taskId, uid]);
+        const user = await db.get('SELECT id, username, email FROM users WHERE id = ?', [uid]);
+        if (user) assigneesToReturn.push(user);
+      }
+    }
+    
     await logActivity(list.project_id, taskId, req.user.id, `created task "${title}" in list "${list.name}"`);
 
-    // If assignee provided, create notification
-    if (assignee_id) {
+    // If assignees provided, create notifications
+    if (assigneesToReturn.length > 0) {
       const projectDetails = await db.get('SELECT name FROM projects WHERE id = ?', [list.project_id]);
-      await sendNotification(
-        io,
-        assignee_id,
-        'New Task Assigned',
-        `${req.user.username} assigned you task "${title}" in "${projectDetails.name}"`,
-        'assignment'
-      );
+      for (const u of assigneesToReturn) {
+        await sendNotification(
+          io,
+          u.id,
+          'New Task Assigned',
+          `${req.user.username} assigned you task "${title}" in "${projectDetails.name}"`,
+          'assignment'
+        );
+      }
     }
 
     if (io) {
@@ -477,7 +776,7 @@ router.post('/lists/:listId/tasks', authMiddleware, async (req, res) => {
       position,
       priority: priority || 'medium',
       due_date: due_date || null,
-      assignee_id: assignee_id ? parseInt(assignee_id) : null,
+      assignees: assigneesToReturn,
       comment_count: 0,
       checklist_summary: { total: 0, completed: 0 }
     };
@@ -492,7 +791,7 @@ router.post('/lists/:listId/tasks', authMiddleware, async (req, res) => {
 // Update task details or position (drag-and-drop)
 router.put('/tasks/:id', authMiddleware, async (req, res) => {
   const taskId = req.params.id;
-  const { title, description, priority, due_date, assignee_id, list_id, position } = req.body;
+  const { title, description, priority, due_date, assignee_ids, list_id, position, milestone_id } = req.body;
   const io = req.app.get('io');
 
   try {
@@ -587,24 +886,37 @@ router.put('/tasks/:id', authMiddleware, async (req, res) => {
         await logActivity(task.project_id, taskId, req.user.id, `set due date of "${title || task.title}" to ${dateStr}`);
       }
 
-      if (assignee_id !== undefined && parseInt(assignee_id) !== task.assignee_id) {
-        const newAssigneeId = assignee_id ? parseInt(assignee_id) : null;
-        await db.run('UPDATE tasks SET assignee_id = ? WHERE id = ?', [newAssigneeId, taskId]);
+      if (milestone_id !== undefined && milestone_id !== task.milestone_id) {
+        await db.run('UPDATE tasks SET milestone_id = ? WHERE id = ?', [milestone_id, taskId]);
+        await logActivity(task.project_id, taskId, req.user.id, `updated milestone for "${title || task.title}"`);
+      }
+
+      if (assignee_ids !== undefined && Array.isArray(assignee_ids)) {
+        // Get existing assignees
+        const existing = await db.all('SELECT user_id FROM task_assignees WHERE task_id = ?', [taskId]);
+        const existingIds = existing.map(e => e.user_id);
         
-        if (newAssigneeId) {
-          const newAssignee = await db.get('SELECT username FROM users WHERE id = ?', [newAssigneeId]);
-          await logActivity(task.project_id, taskId, req.user.id, `assigned "${title || task.title}" to ${newAssignee.username}`);
-          
-          // Notify assignee
-          await sendNotification(
-            io,
-            newAssigneeId,
-            'Task Assigned',
-            `${req.user.username} assigned you task "${title || task.title}" in "${projectDetails.name}"`,
-            'assignment'
-          );
-        } else {
-          await logActivity(task.project_id, taskId, req.user.id, `unassigned task "${title || task.title}"`);
+        const newIds = assignee_ids.map(id => parseInt(id));
+        const toAdd = newIds.filter(id => !existingIds.includes(id));
+        const toRemove = existingIds.filter(id => !newIds.includes(id));
+
+        for (const uid of toRemove) {
+          await db.run('DELETE FROM task_assignees WHERE task_id = ? AND user_id = ?', [taskId, uid]);
+        }
+
+        for (const uid of toAdd) {
+          await db.run('INSERT INTO task_assignees (task_id, user_id) VALUES (?, ?)', [taskId, uid]);
+          const user = await db.get('SELECT username FROM users WHERE id = ?', [uid]);
+          if (user) {
+            await logActivity(task.project_id, taskId, req.user.id, `assigned "${title || task.title}" to ${user.username}`);
+            await sendNotification(
+              io,
+              uid,
+              'Task Assigned',
+              `${req.user.username} assigned you task "${title || task.title}" in "${projectDetails.name}"`,
+              'assignment'
+            );
+          }
         }
       }
     }
@@ -663,10 +975,9 @@ router.get('/tasks/:id/details', authMiddleware, async (req, res) => {
   try {
     const db = getDb();
     const task = await db.get(`
-      SELECT t.*, l.project_id, l.name as list_name, u.username as assignee_name, u.email as assignee_email
+      SELECT t.*, l.project_id, l.name as list_name
       FROM tasks t
       JOIN lists l ON t.list_id = l.id
-      LEFT JOIN users u ON t.assignee_id = u.id
       WHERE t.id = ?
     `, [taskId]);
 
@@ -674,6 +985,15 @@ router.get('/tasks/:id/details', authMiddleware, async (req, res) => {
 
     const isJoined = await checkMember(task.project_id, req.user.id);
     if (!isJoined) return res.status(403).json({ error: 'Access denied' });
+
+    // Fetch assignees
+    const assignees = await db.all(`
+      SELECT u.id, u.username, u.email
+      FROM task_assignees ta
+      JOIN users u ON ta.user_id = u.id
+      WHERE ta.task_id = ?
+    `, [taskId]);
+    task.assignees = assignees;
 
     // Fetch checklist
     const checklist = await db.all('SELECT * FROM checklists WHERE task_id = ? ORDER BY id ASC', [taskId]);
@@ -693,15 +1013,19 @@ router.get('/tasks/:id/details', authMiddleware, async (req, res) => {
       FROM activities a 
       JOIN users u ON a.user_id = u.id 
       WHERE a.task_id = ? 
-      ORDER BY a.created_at DESC LIMIT 30
+      ORDER BY a.created_at DESC
     `, [taskId]);
 
-    res.json({
-      task,
-      checklist,
-      comments,
-      activities
-    });
+    // Fetch attachments
+    const attachments = await db.all(`
+      SELECT a.*, u.username as uploader_name
+      FROM attachments a
+      JOIN users u ON a.uploaded_by = u.id
+      WHERE a.task_id = ?
+      ORDER BY a.created_at DESC
+    `, [taskId]);
+
+    res.json({ task, checklist, comments, activities, attachments });
   } catch (error) {
     console.error('Get task details error:', error);
     res.status(500).json({ error: 'Server error fetching task details' });
@@ -914,6 +1238,21 @@ router.get('/notifications', authMiddleware, async (req, res) => {
   }
 });
 
+// Mark all as read (MUST come before /:id/read to avoid 'read-all' being matched as :id)
+router.put('/notifications/read-all', authMiddleware, async (req, res) => {
+  try {
+    const db = getDb();
+    await db.run(
+      'UPDATE notifications SET is_read = 1 WHERE user_id = ?',
+      [req.user.id]
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Read all notifications error:', error);
+    res.status(500).json({ error: 'Server error updating notifications' });
+  }
+});
+
 // Mark notification as read
 router.put('/notifications/:id/read', authMiddleware, async (req, res) => {
   try {
@@ -926,21 +1265,6 @@ router.put('/notifications/:id/read', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Read notification error:', error);
     res.status(500).json({ error: 'Server error updating notification' });
-  }
-});
-
-// Mark all as read
-router.put('/notifications/read-all', authMiddleware, async (req, res) => {
-  try {
-    const db = getDb();
-    await db.run(
-      'UPDATE notifications SET is_read = 1 WHERE user_id = ?',
-      [req.user.id]
-    );
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Read all notifications error:', error);
-    res.status(500).json({ error: 'Server error updating notifications' });
   }
 });
 
@@ -992,6 +1316,86 @@ router.get('/projects/:id/activities', authMiddleware, async (req, res) => {
   } catch (error) {
     console.error('Fetch project activities error:', error);
     res.status(500).json({ error: 'Server error fetching activities' });
+  }
+});
+
+// POST /tasks/:id/attachments - Upload an attachment
+router.post('/tasks/:id/attachments', authMiddleware, upload.single('file'), async (req, res) => {
+  const taskId = req.params.id;
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const db = getDb();
+    const task = await db.get(`
+      SELECT t.*, l.project_id
+      FROM tasks t
+      JOIN lists l ON t.list_id = l.id
+      WHERE t.id = ?
+    `, [taskId]);
+
+    if (!task) return res.status(404).json({ error: 'Task not found' });
+
+    const isJoined = await checkMember(task.project_id, req.user.id);
+    if (!isJoined) return res.status(403).json({ error: 'Access denied' });
+
+    const result = await db.run(
+      'INSERT INTO attachments (task_id, filename, filepath, uploaded_by) VALUES (?, ?, ?, ?)',
+      [taskId, req.file.originalname, `/uploads/${req.file.filename}`, req.user.id]
+    );
+
+    const attachmentId = result.lastID;
+    await logActivity(task.project_id, taskId, req.user.id, `attached file "${req.file.originalname}"`);
+
+    const newAttachment = await db.get(`
+      SELECT a.*, u.username as uploader_name
+      FROM attachments a
+      JOIN users u ON a.uploaded_by = u.id
+      WHERE a.id = ?
+    `, [attachmentId]);
+
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`project:${task.project_id}`).emit('board-updated', { type: 'attachment-added', taskId });
+    }
+
+    res.status(201).json(newAttachment);
+  } catch (error) {
+    console.error('Upload attachment error:', error);
+    res.status(500).json({ error: 'Server error uploading file' });
+  }
+});
+
+// DELETE /attachments/:id
+router.delete('/attachments/:id', authMiddleware, async (req, res) => {
+  const attachmentId = req.params.id;
+  try {
+    const db = getDb();
+    const attachment = await db.get(`
+      SELECT a.*, l.project_id 
+      FROM attachments a
+      JOIN tasks t ON a.task_id = t.id
+      JOIN lists l ON t.list_id = l.id
+      WHERE a.id = ?
+    `, [attachmentId]);
+
+    if (!attachment) return res.status(404).json({ error: 'Attachment not found' });
+
+    const isJoined = await checkMember(attachment.project_id, req.user.id);
+    if (!isJoined) return res.status(403).json({ error: 'Access denied' });
+
+    await db.run('DELETE FROM attachments WHERE id = ?', [attachmentId]);
+
+    await logActivity(attachment.project_id, attachment.task_id, req.user.id, `deleted attachment "${attachment.filename}"`);
+
+    const io = req.app.get('io');
+    if (io) {
+      io.to(`project:${attachment.project_id}`).emit('board-updated', { type: 'attachment-deleted', taskId: attachment.task_id });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete attachment error:', error);
+    res.status(500).json({ error: 'Server error deleting attachment' });
   }
 });
 

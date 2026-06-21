@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { api } from '../utils/api';
 import { useSocket } from '../context/SocketContext';
 import { useAuth } from '../context/AuthContext';
@@ -7,7 +7,7 @@ import {
   Calendar, FileText, Activity, Trash
 } from 'lucide-react';
 
-export default function TaskModal({ taskId, projectMembers, onClose }) {
+export default function TaskModal({ taskId, projectMembers, milestones = [], onClose }) {
   const socket = useSocket();
   const { user } = useAuth();
 
@@ -15,6 +15,7 @@ export default function TaskModal({ taskId, projectMembers, onClose }) {
   const [checklist, setChecklist] = useState([]);
   const [comments, setComments] = useState([]);
   const [activities, setActivities] = useState([]);
+  const [attachments, setAttachments] = useState([]);
   const [loading, setLoading] = useState(true);
 
   // Field Edit States
@@ -26,24 +27,25 @@ export default function TaskModal({ taskId, projectMembers, onClose }) {
 
   const [savingTitle, setSavingTitle] = useState(false);
 
-  const fetchTaskDetails = async () => {
+  const fetchTaskDetails = useCallback(async () => {
     try {
       const data = await api.get(`/tasks/${taskId}/details`);
       setTask(data.task);
       setChecklist(data.checklist);
       setComments(data.comments);
       setActivities(data.activities);
+      setAttachments(data.attachments || []);
       setDescText(data.task.description || '');
       setLoading(false);
     } catch (err) {
       console.error('Error fetching task details:', err);
       setLoading(false);
     }
-  };
+  }, [taskId]);
 
   useEffect(() => {
     fetchTaskDetails();
-  }, [taskId]);
+  }, [fetchTaskDetails]);
 
   // WebSocket Live Sync for Task Details
   useEffect(() => {
@@ -61,11 +63,20 @@ export default function TaskModal({ taskId, projectMembers, onClose }) {
       }
     });
 
+    socket.on('board-updated', (data) => {
+      if (data.taskId && parseInt(data.taskId) === parseInt(taskId)) {
+        if (data.type === 'attachment-added' || data.type === 'attachment-deleted') {
+          fetchTaskDetails();
+        }
+      }
+    });
+
     return () => {
       socket.off('comment-added');
       socket.off('task-updated');
+      socket.off('board-updated');
     };
-  }, [socket, taskId]);
+  }, [socket, taskId, fetchTaskDetails]);
 
   const handleUpdateTaskField = async (fields) => {
     try {
@@ -139,6 +150,41 @@ export default function TaskModal({ taskId, projectMembers, onClose }) {
     try {
       await api.delete(`/tasks/${taskId}`);
       onClose();
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleFileUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      // Create a specific axios instance or use fetch for multipart/form-data
+      const token = localStorage.getItem('token');
+      const res = await fetch(`http://localhost:5000/api/tasks/${taskId}/attachments`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        },
+        body: formData
+      });
+      if (res.ok) {
+        const newAtt = await res.json();
+        setAttachments([newAtt, ...attachments]);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleDeleteAttachment = async (attachmentId) => {
+    try {
+      await api.delete(`/attachments/${attachmentId}`);
+      setAttachments(attachments.filter(a => a.id !== attachmentId));
     } catch (err) {
       console.error(err);
     }
@@ -277,6 +323,33 @@ export default function TaskModal({ taskId, projectMembers, onClose }) {
               </form>
             </div>
 
+            {/* Attachments */}
+            <div>
+              <div className="task-section-title">
+                <FileText size={16} /> Attachments
+              </div>
+              <div style={{ marginBottom: '12px' }}>
+                <label className="btn btn-secondary" style={{ cursor: 'pointer', display: 'inline-flex', padding: '6px 12px', fontSize: '0.85rem' }}>
+                  Upload File
+                  <input type="file" onChange={handleFileUpload} style={{ display: 'none' }} />
+                </label>
+              </div>
+              {attachments.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '24px' }}>
+                  {attachments.map(att => (
+                    <div key={att.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--bg-card)', borderRadius: '6px', border: '1px solid var(--border-color)' }}>
+                      <a href={`http://localhost:5000${att.filepath}`} target="_blank" rel="noreferrer" style={{ color: 'var(--primary)', textDecoration: 'none', fontSize: '0.9rem', wordBreak: 'break-all' }}>
+                        {att.filename}
+                      </a>
+                      <button onClick={() => handleDeleteAttachment(att.id)} style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '4px' }}>
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {/* Comments Thread */}
             <div>
               <div className="task-section-title">
@@ -326,21 +399,48 @@ export default function TaskModal({ taskId, projectMembers, onClose }) {
 
           {/* Right Column Sidebar (Fields, Actions, Activity logs) */}
           <div className="task-modal-right">
-            {/* Assignee */}
+            {/* Assignees */}
             <div className="sidebar-group">
-              <label htmlFor="assigneeSelect">Assignee</label>
-              <select 
-                id="assigneeSelect"
-                className="sidebar-select"
-                value={task.assignee_id || ''}
-                onChange={(e) => handleUpdateTaskField({ assignee_id: e.target.value || null })}
-              >
-                <option value="">Unassigned</option>
-                {projectMembers.map(m => (
-                  <option key={m.id} value={m.id}>{m.username}</option>
-                ))}
-              </select>
+              <label>Assignees</label>
+              <div className="sidebar-select" style={{ height: 'auto', padding: '8px', maxHeight: '150px', overflowY: 'auto' }}>
+                {projectMembers.map(m => {
+                  const isAssigned = task.assignees && task.assignees.some(a => a.id === m.id);
+                  return (
+                    <label key={m.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', cursor: 'pointer', fontSize: '0.85rem' }}>
+                      <input 
+                        type="checkbox" 
+                        checked={isAssigned || false} 
+                        onChange={(e) => {
+                          const newAssignees = e.target.checked 
+                            ? [...(task.assignees || []), m]
+                            : (task.assignees || []).filter(a => a.id !== m.id);
+                          const newIds = newAssignees.map(a => a.id);
+                          handleUpdateTaskField({ assignees: newAssignees, assignee_ids: newIds });
+                        }}
+                      />
+                      {m.username}
+                    </label>
+                  );
+                })}
+              </div>
             </div>
+
+            {/* Milestone */}
+            {milestones.length > 0 && (
+              <div className="sidebar-group">
+                <label>Milestone</label>
+                <select 
+                  className="sidebar-select"
+                  value={task.milestone_id || ''}
+                  onChange={(e) => handleUpdateTaskField({ milestone_id: e.target.value ? parseInt(e.target.value) : null })}
+                >
+                  <option value="">No Milestone</option>
+                  {milestones.map(m => (
+                    <option key={m.id} value={m.id}>{m.title}</option>
+                  ))}
+                </select>
+              </div>
+            )}
 
             {/* Priority */}
             <div className="sidebar-group">

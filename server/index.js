@@ -33,6 +33,10 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api', apiRoutes);
 
+// Serve uploads
+const uploadsPath = path.join(__dirname, '../uploads');
+app.use('/uploads', express.static(uploadsPath));
+
 // Serve static assets in production
 const distPath = path.join(__dirname, '../dist');
 app.use(express.static(distPath));
@@ -103,11 +107,45 @@ io.on('connection', (socket) => {
 // Start Server
 const PORT = process.env.PORT || 5000;
 
+import { getDb } from './db.js';
+import { sendNotification } from './routes/api.js';
+
+async function checkDeadlines() {
+  try {
+    const db = getDb();
+    const tomorrowTasks = await db.all(`
+      SELECT t.id, t.title, t.project_id
+      FROM tasks t
+      WHERE date(t.due_date) = date('now', '+1 day')
+    `);
+
+    for (const task of tomorrowTasks) {
+      const assignees = await db.all('SELECT user_id FROM task_assignees WHERE task_id = ?', [task.id]);
+      for (const a of assignees) {
+        // Only send if not sent yet (very simplified, we just send it, might be spammy if we don't track it, 
+        // but since we run once a day ideally, it's fine. For a robust system we'd track sent reminders.)
+        await sendNotification(
+          app.get('io'),
+          a.user_id,
+          'Deadline Tomorrow!',
+          `Your task "${task.title}" is due tomorrow!`,
+          'alert'
+        );
+      }
+    }
+  } catch (err) {
+    console.error('Error checking deadlines:', err);
+  }
+}
+
 async function startServer() {
   try {
     await initDb();
     server.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
+      // Check immediately and then every 24 hours
+      checkDeadlines();
+      setInterval(checkDeadlines, 24 * 60 * 60 * 1000);
     });
   } catch (error) {
     console.error('Failed to start server:', error);
@@ -116,3 +154,4 @@ async function startServer() {
 }
 
 startServer();
+
